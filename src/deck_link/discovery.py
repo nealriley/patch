@@ -5,8 +5,7 @@ import socket
 import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional
-from zeroconf import ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf  # type: ignore
-from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser, AsyncServiceInfo  # type: ignore
+from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser, ServiceListener  # type: ignore
 
 from . import PORT, SERVICE_TYPE, SERVICE_NAME
 
@@ -45,11 +44,6 @@ class PeerDiscoveryListener(ServiceListener):
         self.peers: dict[str, DiscoveredPeer] = {}
         self.on_peer_found = on_peer_found
         self.on_peer_lost = on_peer_lost
-        self._zeroconf: Optional[Zeroconf] = None
-
-    def set_zeroconf(self, zc: Zeroconf) -> None:
-        """Set the Zeroconf instance for resolving services."""
-        self._zeroconf = zc
 
     def add_service(self, zc: Zeroconf, service_type: str, name: str) -> None:
         """Called when a new service is discovered."""
@@ -73,13 +67,18 @@ class PeerDiscoveryListener(ServiceListener):
 
     def _handle_service_info(self, name: str, info: ServiceInfo) -> None:
         """Process discovered service info."""
-        addresses = [socket.inet_ntoa(addr) for addr in info.addresses]
-        properties = {
-            k.decode() if isinstance(k, bytes) else k: v.decode()
-            if isinstance(v, bytes)
-            else str(v)
-            for k, v in info.properties.items()
-        }
+        addresses = []
+        for addr in info.addresses:
+            try:
+                addresses.append(socket.inet_ntoa(addr))
+            except Exception:
+                pass
+
+        properties = {}
+        for k, v in info.properties.items():
+            key = k.decode() if isinstance(k, bytes) else str(k)
+            val = v.decode() if isinstance(v, bytes) else str(v)
+            properties[key] = val
 
         peer = DiscoveredPeer(
             name=name,
@@ -100,21 +99,13 @@ class Discovery:
     """
     Manages mDNS service advertisement and discovery.
 
-    Usage:
-        discovery = Discovery(device_name="my-laptop", device_type="laptop")
-        await discovery.start()
-
-        # Get discovered peers
-        peers = discovery.get_peers()
-
-        # Stop when done
-        await discovery.stop()
+    Uses synchronous zeroconf to avoid async compatibility issues.
     """
 
     def __init__(
         self,
         device_name: str,
-        device_type: str = "laptop",  # "laptop" or "deck"
+        device_type: str = "laptop",
         port: int = PORT,
         on_peer_found: Optional[Callable[[DiscoveredPeer], None]] = None,
         on_peer_lost: Optional[Callable[[str], None]] = None,
@@ -125,8 +116,8 @@ class Discovery:
         self.on_peer_found = on_peer_found
         self.on_peer_lost = on_peer_lost
 
-        self._zeroconf: Optional[AsyncZeroconf] = None
-        self._browser: Optional[AsyncServiceBrowser] = None
+        self._zeroconf: Optional[Zeroconf] = None
+        self._browser: Optional[ServiceBrowser] = None
         self._service_info: Optional[ServiceInfo] = None
         self._listener: Optional[PeerDiscoveryListener] = None
         self._running = False
@@ -134,7 +125,6 @@ class Discovery:
     def _get_local_ip(self) -> str:
         """Get the local IP address."""
         try:
-            # Create a socket to determine local IP
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
@@ -148,7 +138,13 @@ class Discovery:
         if self._running:
             return
 
-        self._zeroconf = AsyncZeroconf()
+        # Run zeroconf setup in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._start_sync)
+
+    def _start_sync(self) -> None:
+        """Synchronous startup of zeroconf."""
+        self._zeroconf = Zeroconf()
 
         # Create service info for advertising
         local_ip = self._get_local_ip()
@@ -167,9 +163,7 @@ class Discovery:
         )
 
         # Register our service
-        assert self._zeroconf is not None
-        assert self._service_info is not None
-        await self._zeroconf.async_register_service(self._service_info)
+        self._zeroconf.register_service(self._service_info)
         logger.info(f"Advertising as {service_name} on {local_ip}:{self.port}")
 
         # Set up listener for peer discovery
@@ -179,8 +173,8 @@ class Discovery:
         )
 
         # Start browsing for peers
-        self._browser = AsyncServiceBrowser(
-            self._zeroconf.zeroconf,
+        self._browser = ServiceBrowser(
+            self._zeroconf,
             SERVICE_TYPE,
             self._listener,
         )
@@ -190,7 +184,6 @@ class Discovery:
 
     def _on_peer_found(self, peer: DiscoveredPeer) -> None:
         """Filter out self from discovered peers."""
-        # Don't report ourselves
         if peer.name.startswith(self.device_name):
             return
         if self.on_peer_found:
@@ -201,16 +194,21 @@ class Discovery:
         if not self._running:
             return
 
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._stop_sync)
+
+    def _stop_sync(self) -> None:
+        """Synchronous shutdown of zeroconf."""
         if self._browser:
             self._browser.cancel()
             self._browser = None
 
         if self._service_info and self._zeroconf:
-            await self._zeroconf.async_unregister_service(self._service_info)
+            self._zeroconf.unregister_service(self._service_info)
             self._service_info = None
 
         if self._zeroconf:
-            await self._zeroconf.async_close()
+            self._zeroconf.close()
             self._zeroconf = None
 
         self._running = False
@@ -221,7 +219,6 @@ class Discovery:
         if not self._listener:
             return []
 
-        # Filter out ourselves
         return [
             peer
             for peer in self._listener.peers.values()
@@ -239,11 +236,7 @@ class Discovery:
 
 
 async def discover_peers_once(timeout: float = 3.0) -> list[DiscoveredPeer]:
-    """
-    Quick one-shot discovery of peers.
-
-    Useful for CLI tools or quick checks.
-    """
+    """Quick one-shot discovery of peers."""
     peers: list[DiscoveredPeer] = []
 
     def on_found(peer: DiscoveredPeer) -> None:
@@ -262,7 +255,7 @@ async def discover_peers_once(timeout: float = 3.0) -> list[DiscoveredPeer]:
 
 
 if __name__ == "__main__":
-    # Quick test
+
     async def main() -> None:
         logging.basicConfig(level=logging.INFO)
         print("Scanning for Deck-Link peers...")
