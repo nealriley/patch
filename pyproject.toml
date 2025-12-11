@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deck-link"
+version = "0.1.0"
+description = "Bidirectional communication bridge between Steam Deck and Linux laptop"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Neal" }
+]
+dependencies = [
+    "websockets>=12.0",
+    "zeroconf>=0.131.0",
+    "msgpack>=1.0.0",
+    "click>=8.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pyinstaller>=6.0.0",
+]
+
+[project.scripts]
+deck-link = "deck_link.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deck_link"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
